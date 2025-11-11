@@ -1148,10 +1148,9 @@ app.get("/oauth/start", (req, res) => {
 app.get("/oauth/complete", async (req, res) => {
   const { idToken, redirect } = req.query;
   const decoded = await admin.auth().verifyIdToken(idToken);
-  const mcpToken = jwt.sign({ uid: decoded.uid }, process.env.JWT_SECRET, { expiresIn: "1h" });
+  const mcpToken = jwt.sign({ uid: decoded.uid }, process.env.JWT_SECRET);
   res.redirect(`${redirect}?token=${mcpToken}`);
 });
-
 // ==============================================
 // SERVER START
 // ==============================================
