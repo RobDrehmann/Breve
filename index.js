@@ -31,6 +31,7 @@ app.use(express.urlencoded({ limit: "50mb", extended: true }));
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const pc = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
 const index = pc.index(process.env.PINECONE_INDEX);
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
