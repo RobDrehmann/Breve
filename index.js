@@ -1140,7 +1140,8 @@ ${JSON.stringify(user.profile, null, 2)}`;
 */
 // OAuth routes
 app.get("/oauth/start", (req, res) => {
-  res.redirect(`http://localhost:5173/Login?redirect=http://localhost:3333/auth/callback`);
+  const callbackUrl = req.query.redirect || "default-callback-url";
+  res.redirect(`${FRONTEND_URL}/Login?redirect=${callbackUrl}`);
 });
 
 app.get("/oauth/complete", async (req, res) => {
