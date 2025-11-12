@@ -1147,9 +1147,12 @@ app.get("/oauth/start", (req, res) => {
 
 app.get("/oauth/complete", async (req, res) => {
   const { idToken, redirect } = req.query;
-  const decoded = await admin.auth().verifyIdToken(idToken);
-  const mcpToken = jwt.sign({ uid: decoded.uid }, process.env.JWT_SECRET);
-  res.redirect(`${redirect}?token=${mcpToken}`);
+  
+  // Verify it's valid, but then pass the original idToken through
+  await admin.auth().verifyIdToken(idToken);
+  
+  // Pass the ORIGINAL Firebase idToken, not a custom JWT
+  res.redirect(`${redirect}?token=${idToken}`);
 });
 // ==============================================
 // SERVER START
