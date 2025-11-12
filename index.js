@@ -1139,35 +1139,19 @@ ${JSON.stringify(user.profile, null, 2)}`;
   }
 });
 */
-/// ======= /oauth/start =======
+// OAuth routes
 app.get("/oauth/start", (req, res) => {
-  const callbackUrl = req.query.callbackUrl; // expected from MCP
-  if (!callbackUrl) {
-    return res.status(400).send("Missing callbackUrl");
-  }
-
-  // Redirect to frontend login page, passing callbackUrl along
-  res.redirect(`${FRONTEND_URL}/Login?callbackUrl=${encodeURIComponent(callbackUrl)}`);
+  const callbackUrl = req.query.redirect || "default-callback-url";
+  res.redirect(`${FRONTEND_URL}/Login?redirect=${callbackUrl}`);
 });
-
-// ======= /oauth/complete =======
 app.get("/oauth/complete", async (req, res) => {
-  const { idToken, callbackUrl } = req.query;
-
-  if (!idToken || !callbackUrl) {
-    return res.status(400).send("Missing idToken or callbackUrl");
-  }
-
-  try {
-    // Verify Firebase ID token
-    await admin.auth().verifyIdToken(idToken);
-
-    // Redirect to MCP callback with token
-    res.redirect(`${callbackUrl}?token=${idToken}`);
-  } catch (err) {
-    console.error("Token verification failed:", err);
-    res.status(401).send("Invalid token");
-  }
+  const { idToken, redirect } = req.query;
+  
+  // Verify it's valid, but then pass the original idToken through
+  await admin.auth().verifyIdToken(idToken);
+  
+  // Pass the ORIGINAL Firebase idToken, not a custom JWT
+  res.redirect(`${redirect}?token=${idToken}`);
 });
 
 // ==============================================
