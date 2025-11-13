@@ -807,6 +807,7 @@ app.post("/api/convo", async (req, res) => {
 });
 
 // Get profile summary
+// Get profile summary
 app.get("/api/getprofile", async (req, res) => {
   try {
     // Query Pinecone for context
@@ -814,10 +815,9 @@ app.get("/api/getprofile", async (req, res) => {
 
     const uid = req.query.uid;
     const user = await getUser(uid);
-    const userNamespace = index.namespace(uid);
  
     
-    if (!user || !user.profile) {
+    if (!user) {
       return res.status(404).json({ error: "User profile not found" });
     }
     console.log(user)
@@ -979,6 +979,7 @@ Simply maintain consistency by default.`,
     res.status(500).json({ error: err.message });
   }
 });
+
 
 // Save conversation text
 app.post("/text", async (req, res) => {
