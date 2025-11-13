@@ -377,13 +377,14 @@ async function deleteFile(uid, fileId) {
 // Ask logic (Gets profile from Firebase + context from Pinecone)
 async function askUser(username, question, conversation = [], uuid) {
   const usersRef = db.collection("users");
-  let querySnapshot
+  let querySnapshot;
+  let userDoc;
   if (!username){
-    
-    querySnapshot = await usersRef.doc(uuid)
+    userDoc = await usersRef.doc(uuid);
   }else{
      // Get user by username from Firebase
-   querySnapshot = await usersRef.where("username", "==", username).limit(1).get();
+   let querySnapshot = await usersRef.where("username", "==", username).limit(1).get();
+    userDoc = temp.docs[0];
   }
 
   console.log("🔍 Looking for user with username:", username);
@@ -395,7 +396,7 @@ async function askUser(username, question, conversation = [], uuid) {
     throw new Error(`User not found with username: ${username}`);
   }
 
-  const userDoc = querySnapshot.docs[0];
+
   const userData = userDoc.data();
   const uid = userDoc.id;
   let isOwner = "a guest"
