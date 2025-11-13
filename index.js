@@ -379,22 +379,33 @@ async function askUser(username, question, conversation = [], uuid) {
   const usersRef = db.collection("users");
   let querySnapshot;
   let userDoc;
-  if (uuid){
-    userDoc = await usersRef.doc(uuid);
-  }else{
-     // Get user by username from Firebase
-   let querySnapshot = await usersRef.where("username", "==", username).limit(1).get();
-    userDoc = querySnapshot.docs[0];
-  }
+   if (uuid) {
+      // get document snapshot by uid
+      const docRef = usersRef.doc(uuid);
+      userDocSnapshot = await docRef.get();          // <-- important: call .get()
+      if (!userDocSnapshot.exists) {
+        throw new Error(`User not found with uid: ${uuid}`);
+      }
+    } else {
+      // Get user by username from Firebase
+      const querySnapshot = await usersRef
+        .where("username", "==", username)
+        .limit(1)
+        .get();
 
-  console.log(userDoc);
+      if (querySnapshot.empty) {
+        throw new Error(`User not found with username: ${username}`);
+      }
+
+      userDocSnapshot = querySnapshot.docs[0]; 
 
   
 
 
 
-  const userData = userDoc.data();
-  const uid = userDoc.id;
+ console.log(userDocSnapshot);            // DocumentSnapshot / QueryDocumentSnapshot
+    const userData = userDocSnapshot.data(); // safe now
+    const uid = userDocSnapshot.id;
   let isOwner = "a guest"
   if(uid == uuid){
      isOwner =  username;
