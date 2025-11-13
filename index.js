@@ -399,7 +399,7 @@ async function askUser(username, question, conversation = [], uuid) {
 
       userDocSnapshot = querySnapshot.docs[0]; 
 
-  
+    }
 
 
 
