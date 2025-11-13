@@ -813,8 +813,9 @@ app.get("/api/getprofile", async (req, res) => {
     // Query Pinecone for context
   
 
-    const uid = req.body.uid;
+    const uid = req.query.uid;
     const user = await getUser(uid);
+    console.log(uid);
  
     
     if (!user) {
