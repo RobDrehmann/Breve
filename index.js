@@ -376,13 +376,19 @@ async function deleteFile(uid, fileId) {
 
 // Ask logic (Gets profile from Firebase + context from Pinecone)
 async function askUser(username, question, conversation = [], uuid) {
-  if (!username || !question) throw new Error("Missing username or question");
+  const usersRef = db.collection("users");
+  let querySnapshot
+  if (!username){
+    getUser(uid);
+    querySnapshot = await usersRef.doc(uid)
+  }else{
+     // Get user by username from Firebase
+   querySnapshot = await usersRef.where("username", "==", username).limit(1).get();
+  }
 
   console.log("🔍 Looking for user with username:", username);
 
-  // Get user by username from Firebase
-  const usersRef = db.collection("users");
-  const querySnapshot = await usersRef.where("username", "==", username).limit(1).get();
+  
 
   if (querySnapshot.empty) {
     console.error("❌ User not found with username:", username);
@@ -1143,7 +1149,15 @@ ${JSON.stringify(user.profile, null, 2)}`;
   }
 });
 */
-
+// Clean up old auth codes every 10 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [code, data] of pendingAuths.entries()) {
+    if (now - data.createdAt > 10 * 60 * 1000) {
+      pendingAuths.delete(code);
+    }
+  }
+}, 10 * 60 * 1000);
 
 // Replace with Firestore
 const pendingAuthsRef = db.collection("oauthPendingAuths");
