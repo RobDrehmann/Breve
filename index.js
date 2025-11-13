@@ -380,7 +380,7 @@ async function askUser(username, question, conversation = [], uuid) {
   let querySnapshot;
   let userDoc;
   let userDocSnapshot;
-   if (uuid) {
+   if (uuid != "guest") {
       // get document snapshot by uid
       const docRef = usersRef.doc(uuid);
       userDocSnapshot = await docRef.get();          // <-- important: call .get()
