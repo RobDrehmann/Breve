@@ -379,6 +379,7 @@ async function askUser(username, question, conversation = [], uuid) {
   const usersRef = db.collection("users");
   let querySnapshot;
   let userDoc;
+  let userDocSnapshot;
    if (uuid) {
       // get document snapshot by uid
       const docRef = usersRef.doc(uuid);
