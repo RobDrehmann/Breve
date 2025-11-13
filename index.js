@@ -391,10 +391,6 @@ async function askUser(username, question, conversation = [], uuid) {
 
   
 
-  if (querySnapshot.empty) {
-    console.error("❌ User not found with username:", username);
-    throw new Error(`User not found with username: ${username}`);
-  }
 
 
   const userData = userDoc.data();
