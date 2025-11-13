@@ -387,7 +387,7 @@ async function askUser(username, question, conversation = [], uuid) {
     userDoc = querySnapshot.docs[0];
   }
 
-  console.log("🔍 Looking for user with username:", username);
+  console.log(userDoc);
 
   
 
