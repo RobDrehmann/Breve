@@ -813,7 +813,7 @@ app.get("/api/getprofile", async (req, res) => {
     // Query Pinecone for context
   
 
-    const uid = req.query.uid;
+    const uid = req.body.uid;
     const user = await getUser(uid);
  
     
