@@ -1143,15 +1143,7 @@ ${JSON.stringify(user.profile, null, 2)}`;
   }
 });
 */
-// Clean up old auth codes every 10 minutes
-setInterval(() => {
-  const now = Date.now();
-  for (const [code, data] of pendingAuths.entries()) {
-    if (now - data.createdAt > 10 * 60 * 1000) {
-      pendingAuths.delete(code);
-    }
-  }
-}, 10 * 60 * 1000);
+
 
 // Replace with Firestore
 const pendingAuthsRef = db.collection("oauthPendingAuths");
