@@ -384,7 +384,7 @@ async function askUser(username, question, conversation = [], uuid) {
   }else{
      // Get user by username from Firebase
    let querySnapshot = await usersRef.where("username", "==", username).limit(1).get();
-    userDoc = temp.docs[0];
+    userDoc = querySnapshot.docs[0];
   }
 
   console.log("🔍 Looking for user with username:", username);
