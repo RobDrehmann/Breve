@@ -379,8 +379,8 @@ async function askUser(username, question, conversation = [], uuid) {
   const usersRef = db.collection("users");
   let querySnapshot
   if (!username){
-    getUser(uid);
-    querySnapshot = await usersRef.doc(uid)
+    
+    querySnapshot = await usersRef.doc(uuid)
   }else{
      // Get user by username from Firebase
    querySnapshot = await usersRef.where("username", "==", username).limit(1).get();
