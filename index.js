@@ -15,7 +15,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 import { PDFParse } from "pdf-parse";
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+// Add this at the top with other imports
+import crypto from "crypto";
 
 
 
@@ -33,8 +34,9 @@ const pc = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
 const index = pc.index(process.env.PINECONE_INDEX);
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 
+
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
+  credential: admin.credential.cert("./firebase-service-account.json"),
   storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
 });
 const db = admin.firestore();
@@ -1139,19 +1141,148 @@ ${JSON.stringify(user.profile, null, 2)}`;
   }
 });
 */
-// OAuth routes
-app.get("/oauth/start", (req, res) => {
-  const callbackUrl = req.query.redirect || "default-callback-url";
-  res.redirect(`${FRONTEND_URL}/Login?redirect=${callbackUrl}`);
+// Clean up old auth codes every 10 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [code, data] of pendingAuths.entries()) {
+    if (now - data.createdAt > 10 * 60 * 1000) {
+      pendingAuths.delete(code);
+    }
+  }
+}, 10 * 60 * 1000);
+
+// Replace with Firestore
+const pendingAuthsRef = db.collection("oauthPendingAuths");
+
+// OAuth2 Authorization Endpoint
+app.get("/oauth/authorize", async (req, res) => {
+  const { redirect_uri, state, code_challenge, code_challenge_method } = req.query;
+  
+  console.log("📝 OAuth authorization request:", { redirect_uri, state });
+  
+  const authCode = crypto.randomBytes(32).toString("hex");
+  
+  // Store in Firestore instead of Map
+  await pendingAuthsRef.doc(authCode).set({
+    redirect_uri,
+    state,
+    code_challenge,
+    code_challenge_method,
+    createdAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+  
+  res.redirect(`${FRONTEND_URL}/Login?authCode=${authCode}&redirect_uri=${encodeURIComponent(redirect_uri)}&state=${state}`);
 });
-app.get("/oauth/complete", async (req, res) => {
-  const { idToken, redirect } = req.query;
+
+// OAuth2 Token Endpoint
+app.post("/oauth/token", async (req, res) => {
+  const { grant_type, code, redirect_uri, code_verifier } = req.body;
   
-  // Verify it's valid, but then pass the original idToken through
-  await admin.auth().verifyIdToken(idToken);
+  console.log("🎫 Token exchange request");
   
-  // Pass the ORIGINAL Firebase idToken, not a custom JWT
-  res.redirect(`${redirect}?token=${idToken}`);
+  if (grant_type !== "authorization_code") {
+    return res.status(400).json({ error: "unsupported_grant_type" });
+  }
+  
+  // Get from Firestore
+  const authDoc = await pendingAuthsRef.doc(code).get();
+  
+  if (!authDoc.exists) {
+    console.log("❌ Invalid authorization code");
+    return res.status(400).json({ error: "invalid_grant" });
+  }
+  
+  const authData = authDoc.data();
+  
+  // Verify PKCE challenge
+  if (authData.code_challenge && code_verifier) {
+    const hash = crypto
+      .createHash("sha256")
+      .update(code_verifier)
+      .digest("base64url");
+    
+    if (hash !== authData.code_challenge) {
+      console.log("❌ PKCE verification failed");
+      return res.status(400).json({ error: "invalid_grant" });
+    }
+  }
+  
+  // Verify redirect URI matches
+  if (authData.redirect_uri !== redirect_uri) {
+    console.log("❌ Redirect URI mismatch");
+    return res.status(400).json({ error: "invalid_grant" });
+  }
+  
+  const firebaseToken = authData.firebaseToken;
+  
+  if (!firebaseToken) {
+    console.log("❌ No Firebase token attached");
+    return res.status(400).json({ error: "invalid_grant" });
+  }
+  
+  console.log("✅ Token exchange successful");
+  
+  // Clean up from Firestore
+  await pendingAuthsRef.doc(code).delete();
+  
+  res.json({
+    access_token: firebaseToken,
+    token_type: "Bearer",
+    expires_in: 3600
+  });
+});
+
+// OAuth callback
+app.get("/oauth/callback", async (req, res) => {
+  const { idToken, authCode, state } = req.query;
+  
+  console.log("🔄 OAuth callback received");
+  
+  if (!idToken || !authCode) {
+    return res.status(400).send("Missing idToken or authCode");
+  }
+  
+  try {
+    await admin.auth().verifyIdToken(idToken);
+    
+    // Get from Firestore
+    const authDoc = await pendingAuthsRef.doc(authCode).get();
+    if (!authDoc.exists) {
+      return res.status(400).send("Invalid or expired auth code");
+    }
+    
+    const authData = authDoc.data();
+    
+    // Update in Firestore
+    await pendingAuthsRef.doc(authCode).update({
+      firebaseToken: idToken
+    });
+    
+    console.log("✅ Firebase token attached to auth code");
+    
+    res.redirect(`${authData.redirect_uri}?code=${authCode}&state=${state}`);
+  } catch (err) {
+    console.error("❌ OAuth callback error:", err);
+    res.status(400).send("Authentication failed");
+  }
+});
+
+// Optional: Clean up old auth codes (run this as a scheduled function)
+app.get("/oauth/cleanup", async (req, res) => {
+  const tenMinutesAgo = admin.firestore.Timestamp.fromDate(
+    new Date(Date.now() - 10 * 60 * 1000)
+  );
+  
+  const oldDocs = await pendingAuthsRef
+    .where("createdAt", "<", tenMinutesAgo)
+    .get();
+  
+  const batch = db.batch();
+  oldDocs.docs.forEach(doc => batch.delete(doc.ref));
+  await batch.commit();
+  
+  res.json({ deleted: oldDocs.size });
+
 });
 
 // ==============================================
