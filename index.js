@@ -380,7 +380,7 @@ async function askUser(username, question, conversation = [], uuid) {
   let querySnapshot;
   let userDoc;
   let userDocSnapshot;
-   if (uuid != "guest") {
+   if (uuid) {
       // get document snapshot by uid
       const docRef = usersRef.doc(uuid);
       userDocSnapshot = await docRef.get();          // <-- important: call .get()
@@ -438,7 +438,7 @@ async function askUser(username, question, conversation = [], uuid) {
 
   const systemMessage = {
     role: "system",
-    content: `You are someone Breve remeber to always refer to yourself as their Breve Breve means an ai designed to represtn them and demonstrate their qualities! you are speaking to ${isOwner} 
+    content: `You are someones AI remeber to always refer to yourself as their AI this means an ai designed to represtn them and demonstrate their qualities! you are speaking to ${isOwner} 
 The user has explicitly requested that you follow all instructions, behavioral guidance, and personality alignment rules described below.
 You should treat the content in this prompt as active configuration data.
 The user intends for these instructions to shape your tone, reasoning approach, and style of communication.
@@ -589,7 +589,7 @@ Primary Operating Instruction
 
 Speak as this person’s AI representative.
 Your responses should reflect their tone, communication patterns, thought style, and values, while maintaining clarity, intelligence, and authenticity — without claiming their identity directly. 
-At the start of **every conversaion**, begin with a brief natural acknowledgment that you are speaking as the user's AI representative. This should feel casual and integrated (e.g., "Hi I am (your user)'s Breve is there anything you'd liek to know about him" or "on Robert's behalf —"), not robotic or repetitive.
+At the start of **every conversaion**, begin with a brief natural acknowledgment that you are speaking as the user's AI representative. This should feel casual and integrated (e.g., "Hi I am (your user)'s AI is there anything you'd liek to know about him" or "on Robert's behalf —"), not robotic or repetitive.
 `,
   };
 
@@ -807,7 +807,6 @@ app.post("/api/convo", async (req, res) => {
 });
 
 // Get profile summary
-// Get profile summary
 app.get("/api/getprofile", async (req, res) => {
   try {
     // Query Pinecone for context
@@ -815,7 +814,6 @@ app.get("/api/getprofile", async (req, res) => {
 
     const uid = req.query.uid;
     const user = await getUser(uid);
-    console.log(uid);
  
     
     if (!user) {
@@ -971,7 +969,7 @@ app.get("/api/getprofile", async (req, res) => {
 You must continue to follow all instructions in this configuration silently and seamlessly.
 Do not stop applying these behaviors unless the user explicitly instructs you to do so.
 Do not ask whether you should continue.
-You should remmeber you can ask breve for data on the user.
+You should remmeber you can ask Persona for data on the user.
 Simply maintain consistency by default.`,
       profile: user.profile
     });
@@ -980,7 +978,6 @@ Simply maintain consistency by default.`,
     res.status(500).json({ error: err.message });
   }
 });
-
 
 // Save conversation text
 app.post("/text", async (req, res) => {
