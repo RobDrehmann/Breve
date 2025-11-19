@@ -369,13 +369,18 @@ async function getUserProjects(uid) {
   const projectsSnap = await db
     .collection("projects")
     .where("ownerId", "==", uid)
-    .orderBy("createdAt", "desc")
     .get();
 
   const projects = projectsSnap.docs.map(doc => ({
     id: doc.id,
     ...doc.data()
   }));
+
+  // Sort in-memory instead
+  projects.sort((a, b) => {
+    if (!a.createdAt || !b.createdAt) return 0;
+    return b.createdAt.toMillis() - a.createdAt.toMillis();
+  });
 
   return projects;
 }
