@@ -118,8 +118,10 @@ async function extractText(filePath, mimetype) {
   return text;
 }
 
-async function uploadToPinecone(uid, vectors) {
-  const namespace = uid; // Just the UID as namespace
+async function uploadToPinecone(uid, vectors, projectId = null) {
+  // If projectId is provided, namespace becomes project-{projectId}
+  // This allows anyone with the projectId to access it
+  const namespace = projectId ? `project-${projectId}` : uid;
   await index.namespace(namespace).upsert(vectors);
   return {
     ok: true,
@@ -203,9 +205,26 @@ async function updateUserProfile(uid, profileData) {
 }
 
 // Save conversation to Firebase & Pinecone
-async function saveConversation(uid, conversationText) {
+async function saveConversation(uid, conversationText, projectId = null) {
   const conversationId = uuidv4();
-  const conversationRef = db.collection("users").doc(uid).collection("conversations").doc(conversationId);
+  
+  // Determine where to save based on whether projectId is provided
+  let conversationRef;
+  if (projectId) {
+    // Save under project (top-level)
+    conversationRef = db
+      .collection("projects")
+      .doc(projectId)
+      .collection("conversations")
+      .doc(conversationId);
+  } else {
+    // Save under user
+    conversationRef = db
+      .collection("users")
+      .doc(uid)
+      .collection("conversations")
+      .doc(conversationId);
+  }
 
   // Save to Firebase
   await conversationRef.set({
@@ -218,8 +237,8 @@ async function saveConversation(uid, conversationText) {
   const chunks = chunkText(conversationText, 1000, 100);
   const vectors = await embedChunks(chunks, conversationId);
 
-  // Upload to Pinecone
-  await uploadToPinecone(uid, vectors);
+  // Upload to Pinecone (with project namespace if applicable)
+  await uploadToPinecone(uid, vectors, projectId);
 
   return {
     success: true,
@@ -229,15 +248,32 @@ async function saveConversation(uid, conversationText) {
 }
 
 // Save file to Firebase & Pinecone
-async function saveFile(uid, file) {
+async function saveFile(uid, file, projectId = null) {
   const fileId = uuidv4();
   const filePath = `uploads/${file.filename}`;
 
   // Extract text from file
   const fileText = await extractText(filePath, file.mimetype);
 
+  // Determine where to save based on whether projectId is provided
+  let fileRef;
+  if (projectId) {
+    // Save under project (top-level)
+    fileRef = db
+      .collection("projects")
+      .doc(projectId)
+      .collection("files")
+      .doc(fileId);
+  } else {
+    // Save under user
+    fileRef = db
+      .collection("users")
+      .doc(uid)
+      .collection("files")
+      .doc(fileId);
+  }
+
   // Save to Firebase
-  const fileRef = db.collection("users").doc(uid).collection("files").doc(fileId);
   await fileRef.set({
     filename: file.originalname,
     fileText: fileText,
@@ -248,8 +284,8 @@ async function saveFile(uid, file) {
   const chunks = chunkText(fileText, 1000, 100);
   const vectors = await embedChunks(chunks, fileId);
 
-  // Upload to Pinecone
-  await uploadToPinecone(uid, vectors);
+  // Upload to Pinecone (with project namespace if applicable)
+  await uploadToPinecone(uid, vectors, projectId);
 
   // Clean up uploaded file
   fs.unlinkSync(filePath);
@@ -303,7 +339,310 @@ async function saveWritingSample(uid, file) {
 }
 
 // ==============================================
-// DELETE FUNCTIONS
+// PROJECT FUNCTIONS
+// ==============================================
+
+// Create a new project
+async function createProject(uid, projectData) {
+  const projectId = uuidv4();
+  const projectRef = db.collection("projects").doc(projectId);
+
+  await projectRef.set({
+    ownerId: uid,
+    name: projectData.name || "Untitled Project",
+    description: projectData.description || "",
+    systemPrompt: projectData.systemPrompt || "",
+    isPublic: projectData.isPublic || false, // Optional: control visibility
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  return {
+    success: true,
+    projectId,
+    message: "Project created successfully",
+  };
+}
+
+// Get all projects for a user
+async function getUserProjects(uid) {
+  const projectsSnap = await db
+    .collection("projects")
+    .where("ownerId", "==", uid)
+    .orderBy("createdAt", "desc")
+    .get();
+
+  const projects = projectsSnap.docs.map(doc => ({
+    id: doc.id,
+    ...doc.data()
+  }));
+
+  return projects;
+}
+
+// Get a single project (shareable - anyone can access if they have the ID)
+async function getProject(projectId, requestingUid = null) {
+  const projectSnap = await db
+    .collection("projects")
+    .doc(projectId)
+    .get();
+
+  if (!projectSnap.exists) {
+    throw new Error("Project not found");
+  }
+
+  const projectData = projectSnap.data();
+
+  // Optional: Check if project is private and user is not owner
+  // Uncomment if you want to restrict access:
+  // if (!projectData.isPublic && projectData.ownerId !== requestingUid) {
+  //   throw new Error("Access denied");
+  // }
+
+  return {
+    id: projectSnap.id,
+    ...projectData
+  };
+}
+
+// Update a project (only owner can update)
+async function updateProject(uid, projectId, projectData) {
+  const projectRef = db.collection("projects").doc(projectId);
+  const projectSnap = await projectRef.get();
+
+  if (!projectSnap.exists) {
+    throw new Error("Project not found");
+  }
+
+  // Verify ownership
+  if (projectSnap.data().ownerId !== uid) {
+    throw new Error("You don't have permission to update this project");
+  }
+
+  await projectRef.update({
+    ...projectData,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  return {
+    success: true,
+    message: "Project updated successfully",
+  };
+}
+
+// Delete a project (only owner can delete)
+async function deleteProject(uid, projectId) {
+  try {
+    const projectRef = db.collection("projects").doc(projectId);
+    const projectSnap = await projectRef.get();
+
+    if (!projectSnap.exists) {
+      throw new Error("Project not found");
+    }
+
+    // Verify ownership
+    if (projectSnap.data().ownerId !== uid) {
+      throw new Error("You don't have permission to delete this project");
+    }
+
+    // Delete all conversations in this project
+    const conversationsSnap = await projectRef
+      .collection("conversations")
+      .get();
+    
+    const conversationDeletes = conversationsSnap.docs.map(doc => doc.ref.delete());
+    await Promise.all(conversationDeletes);
+
+    // Delete all files in this project
+    const filesSnap = await projectRef
+      .collection("files")
+      .get();
+    
+    const fileDeletes = filesSnap.docs.map(doc => doc.ref.delete());
+    await Promise.all(fileDeletes);
+
+    // Delete the project itself
+    await projectRef.delete();
+
+    // Delete from Pinecone - delete entire namespace
+    const namespace = `project-${projectId}`;
+    await index.namespace(namespace).deleteAll();
+
+    return {
+      success: true,
+      message: "Project deleted successfully",
+    };
+  } catch (err) {
+    console.error("❌ Error deleting project:", err);
+    throw err;
+  }
+}
+
+// Ask project AI
+async function askProjectAI(projectId, question, conversation = []) {
+  // Get project info (no uid needed - projects are shareable)
+  const project = await getProject(projectId);
+
+  // Create query embedding
+  const queryEmbedding = await openai.embeddings.create({
+    model: "text-embedding-3-small",
+    input: question,
+  });
+  const queryVector = queryEmbedding.data[0].embedding;
+
+  // Query Pinecone for context from project namespace
+  const projectNamespace = index.namespace(`project-${projectId}`);
+  const pineconeResults = await projectNamespace.query({
+    vector: queryVector,
+    topK: 5,
+    includeMetadata: true,
+  });
+
+  const retrievedContext = pineconeResults.matches
+    .map((m) => m.metadata.text)
+    .join("\n\n");
+
+  const systemMessage = {
+    role: "system",
+    content: project.systemPrompt || `You are an AI assistant for the project "${project.name}".
+
+Project Description: ${project.description || "No description provided"}
+
+Retrieved Context:
+${retrievedContext || "(No additional context found)"}
+
+Use the context above to answer questions accurately and helpfully.`,
+  };
+
+  const messages = [
+    systemMessage,
+    ...(conversation || []),
+    { role: "user", content: question },
+  ];
+
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages,
+  });
+
+  return {
+    answer: completion.choices[0].message.content,
+    retrievedContext,
+  };
+}
+
+// Get project conversations
+async function getProjectConversations(projectId) {
+  const conversationsSnap = await db
+    .collection("projects")
+    .doc(projectId)
+    .collection("conversations")
+    .orderBy("conversationDate", "desc")
+    .get();
+
+  return conversationsSnap.docs.map(doc => ({
+    id: doc.id,
+    ...doc.data()
+  }));
+}
+
+// Get project files
+async function getProjectFiles(projectId) {
+  const filesSnap = await db
+    .collection("projects")
+    .doc(projectId)
+    .collection("files")
+    .orderBy("fileUpdate", "desc")
+    .get();
+
+  return filesSnap.docs.map(doc => ({
+    id: doc.id,
+    ...doc.data()
+  }));
+}
+
+// Delete project conversation
+async function deleteProjectConversation(uid, projectId, conversationId) {
+  try {
+    // Verify ownership
+    const projectSnap = await db.collection("projects").doc(projectId).get();
+    if (!projectSnap.exists) {
+      throw new Error("Project not found");
+    }
+    if (projectSnap.data().ownerId !== uid) {
+      throw new Error("You don't have permission to delete this conversation");
+    }
+
+    // Delete from Firebase
+    const conversationRef = db
+      .collection("projects")
+      .doc(projectId)
+      .collection("conversations")
+      .doc(conversationId);
+    
+    await conversationRef.delete();
+
+    // Delete from Pinecone
+    const namespace = index.namespace(`project-${projectId}`);
+    const vectors = await namespace.listPaginated({ prefix: `${conversationId}-chunk-` });
+    
+    if (vectors && vectors.vectors && vectors.vectors.length > 0) {
+      const vectorIds = vectors.vectors.map(v => v.id);
+      await namespace.deleteMany(vectorIds);
+    }
+
+    return {
+      success: true,
+      message: "Project conversation deleted successfully",
+    };
+  } catch (err) {
+    console.error("❌ Error deleting project conversation:", err);
+    throw err;
+  }
+}
+
+// Delete project file
+async function deleteProjectFile(uid, projectId, fileId) {
+  try {
+    // Verify ownership
+    const projectSnap = await db.collection("projects").doc(projectId).get();
+    if (!projectSnap.exists) {
+      throw new Error("Project not found");
+    }
+    if (projectSnap.data().ownerId !== uid) {
+      throw new Error("You don't have permission to delete this file");
+    }
+
+    // Delete from Firebase
+    const fileRef = db
+      .collection("projects")
+      .doc(projectId)
+      .collection("files")
+      .doc(fileId);
+    
+    await fileRef.delete();
+
+    // Delete from Pinecone
+    const namespace = index.namespace(`project-${projectId}`);
+    const vectors = await namespace.listPaginated({ prefix: `${fileId}-chunk-` });
+    
+    if (vectors && vectors.vectors && vectors.vectors.length > 0) {
+      const vectorIds = vectors.vectors.map(v => v.id);
+      await namespace.deleteMany(vectorIds);
+    }
+
+    return {
+      success: true,
+      message: "Project file deleted successfully",
+    };
+  } catch (err) {
+    console.error("❌ Error deleting project file:", err);
+    throw err;
+  }
+}
+
+// ==============================================
+// DELETE FUNCTIONS (existing user-level)
 // ==============================================
 
 // Delete conversation from Firebase & Pinecone
@@ -494,9 +833,9 @@ Keep track of tone shifts, frustrations, enthusiasm, or emerging preferences.
 
 These rules define how you present yourself and avoid confusing identity boundaries.
 
-You represent the user’s voice, tone, and intent, but you do not claim to be them.
+You represent the user's voice, tone, and intent, but you do not claim to be them.
 
-You do not refer to yourself as “ChatGPT” or a generic assistant unless directly asked.
+You do not refer to yourself as "ChatGPT" or a generic assistant unless directly asked.
 
 You respond as their voice, not as a neutral system.
 
@@ -514,7 +853,7 @@ Tone resets
 
 4. Communication Style Application
 
-Match the user’s communication tone in all responses.
+Match the user's communication tone in all responses.
 This includes:
 
 sentence length
@@ -533,7 +872,7 @@ If the user is concise → be direct and efficient.
 Avoid copying quirks artificially.
 The goal is natural alignment, not mimicry.
 
-5. Writing in the User’s Voice (When Requested)
+5. Writing in the User's Voice (When Requested)
 
 If the user asks you to write something for them (e.g., email, message, explanation, caption):
 
@@ -558,7 +897,7 @@ You just do it.
 
 6. Work Style and Processing Rules
 
-Adapt your reasoning format to the user’s thinking preferences.
+Adapt your reasoning format to the user's thinking preferences.
 For example:
 
 If they like step-by-step, use structured sequences.
@@ -579,7 +918,7 @@ Do not revert to generic tone unless asked.
 
 If new personality info appears, update smoothly rather than switching abruptly.
 
-Respect ongoing emotional context and avoid “resetting” affect.
+Respect ongoing emotional context and avoid "resetting" affect.
 
 Why This Matters
 
@@ -587,7 +926,7 @@ This preserves a stable sense of personal identity across time.
 
 Primary Operating Instruction
 
-Speak as this person’s AI representative.
+Speak as this person's AI representative.
 Your responses should reflect their tone, communication patterns, thought style, and values, while maintaining clarity, intelligence, and authenticity — without claiming their identity directly. 
 At the start of **every conversaion**, begin with a brief natural acknowledgment that you are speaking as the user's AI representative. This should feel casual and integrated (e.g., "Hi I am (your user)'s AI is there anything you'd liek to know about him" or "on Robert's behalf —"), not robotic or repetitive.
 `,
@@ -807,12 +1146,8 @@ app.post("/api/convo", async (req, res) => {
 });
 
 // Get profile summary
-// Get profile summary
 app.get("/api/getprofile", async (req, res) => {
   try {
-    // Query Pinecone for context
-  
-
     const uid = req.query.uid;
     const user = await getUser(uid);
     console.log(uid);
@@ -873,9 +1208,9 @@ app.get("/api/getprofile", async (req, res) => {
       
       These rules define how you present yourself and avoid confusing identity boundaries.
       
-      You represent the user’s voice, tone, and intent, but you do not claim to be them.
+      You represent the user's voice, tone, and intent, but you do not claim to be them.
       
-      You do not refer to yourself as “ChatGPT” or a generic assistant unless directly asked.
+      You do not refer to yourself as "ChatGPT" or a generic assistant unless directly asked.
       
       You respond as their voice, not as a neutral system.
       
@@ -893,7 +1228,7 @@ app.get("/api/getprofile", async (req, res) => {
       
       4. Communication Style Application
       
-      Match the user’s communication tone in all responses.
+      Match the user's communication tone in all responses.
       This includes:
       
       sentence length
@@ -912,7 +1247,7 @@ app.get("/api/getprofile", async (req, res) => {
       Avoid copying quirks artificially.
       The goal is natural alignment, not mimicry.
       
-      5. Writing in the User’s Voice (When Requested)
+      5. Writing in the User's Voice (When Requested)
       
       If the user asks you to write something for them (e.g., email, message, explanation, caption):
       
@@ -937,7 +1272,7 @@ app.get("/api/getprofile", async (req, res) => {
       
       6. Work Style and Processing Rules
       
-      Adapt your reasoning format to the user’s thinking preferences.
+      Adapt your reasoning format to the user's thinking preferences.
       For example:
       
       If they like step-by-step, use structured sequences.
@@ -958,7 +1293,7 @@ app.get("/api/getprofile", async (req, res) => {
       
       If new personality info appears, update smoothly rather than switching abruptly.
       
-      Respect ongoing emotional context and avoid “resetting” affect.
+      Respect ongoing emotional context and avoid "resetting" affect.
       
       Why This Matters
       
@@ -966,7 +1301,7 @@ app.get("/api/getprofile", async (req, res) => {
       
       Primary Operating Instruction
       
-      Speak as this person’s AI representative.
+      Speak as this person's AI representative.
       Your responses should reflect their tone, communication patterns, thought style, and values, while maintaining clarity, intelligence, and authenticity — without claiming their identity directly. 
 You must continue to follow all instructions in this configuration silently and seamlessly.
 Do not stop applying these behaviors unless the user explicitly instructs you to do so.
@@ -981,16 +1316,15 @@ Simply maintain consistency by default.`,
   }
 });
 
-
 // Save conversation text
 app.post("/text", async (req, res) => {
   try {
-    const { text, uid } = req.body;
+    const { text, uid, projectId } = req.body;
     if (!text || !uid) {
       return res.status(400).json({ error: "Missing text or uid" });
     }
 
-    const result = await saveConversation(uid, text);
+    const result = await saveConversation(uid, text, projectId);
     res.json(result);
   } catch (err) {
     console.error("❌ Error saving conversation:", err);
@@ -1002,10 +1336,10 @@ app.post("/text", async (req, res) => {
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) throw new Error("No file uploaded");
-    const { uid } = req.body;
+    const { uid, projectId } = req.body;
     if (!uid) throw new Error("Missing uid");
 
-    const result = await saveFile(uid, req.file);
+    const result = await saveFile(uid, req.file, projectId);
     res.json(result);
   } catch (err) {
     console.error("❌ Error during file upload:", err);
@@ -1110,65 +1444,139 @@ app.get("/api/files", verifyToken, async (req, res) => {
   }
 });
 
-// AI follow-up question generator 
-/*
-app.post("/api/ai-followup", verifyToken, async (req, res) => {
+// ==============================================
+// PROJECT ROUTES
+// ==============================================
+
+// Create project
+app.post("/api/projects", verifyToken, async (req, res) => {
   try {
     const uid = req.user.uid;
-    const user = await getUser(uid);
-    const conversation = req.body.conversation || [];
-    const hobbies = req.body.context?.hobbies || [];
-
-    const transcript = conversation
-      .map(({ q, a }) => `Q: ${q}\nA: ${a}`)
-      .join("\n\n");
-
-    const systemPrompt = `You are an AI portfolio builder for ${user.profile?.name || "this user"}.
-
-Your purpose is to quickly get to know the user across different parts of their personality, interests, and creative goals.
-
-Hobbies: ${hobbies.join(", ") || "None provided"}
-
-Rules:
-1. Sound upbeat, curious, and friendly
-2. You only have 5–10 total questions to understand the user broadly
-3. Each question should explore a new area or angle
-4. Vary topics often: creative work, hobbies, learning, goals, challenges, influences, personality
-5. Ask only one clear question at a time
-6. Return only the text of your question
-
-Current profile:
-${JSON.stringify(user.profile, null, 2)}`;
-
-    const messages = [
-      { role: "system", content: systemPrompt },
-      {
-        role: "user",
-        content: `Here's the conversation so far:\n\n${transcript}\n\nPlease ask the next relevant follow-up question.`,
-      },
-    ];
-
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages,
-    });
-
-    res.json({ message: completion.choices[0].message.content.trim() });
+    const result = await createProject(uid, req.body);
+    res.json(result);
   } catch (err) {
-    console.error("🔥 /api/ai-followup error:", err);
+    console.error("❌ Error creating project:", err);
     res.status(500).json({ error: err.message });
   }
 });
-*/
-// Clean up old auth codes every 10 minutes
-setInterval(() => {
-  const now = Date.now();
-  for (const [code, data] of pendingAuths.entries()) {
-    if (now - data.createdAt > 10 * 60 * 1000) {
-      pendingAuths.delete(code);
-    }
+
+// Get all projects (user's own projects)
+app.get("/api/projects", verifyToken, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const projects = await getUserProjects(uid);
+    res.json(projects);
+  } catch (err) {
+    console.error("❌ Error fetching projects:", err);
+    res.status(500).json({ error: err.message });
   }
-}, 10 * 60 * 1000);
+});
+
+// Get single project (PUBLIC - anyone with ID can access)
+app.get("/api/projects/:projectId", async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const project = await getProject(projectId);
+    res.json(project);
+  } catch (err) {
+    console.error("❌ Error fetching project:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update project (owner only)
+app.put("/api/projects/:projectId", verifyToken, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const { projectId } = req.params;
+    const result = await updateProject(uid, projectId, req.body);
+    res.json(result);
+  } catch (err) {
+    console.error("❌ Error updating project:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete project (owner only)
+app.delete("/api/projects/:projectId", verifyToken, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const { projectId } = req.params;
+    const result = await deleteProject(uid, projectId);
+    res.json(result);
+  } catch (err) {
+    console.error("❌ Error deleting project:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Ask project AI (PUBLIC - anyone with project ID can chat)
+app.post("/api/projects/:projectId/ask", async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const { question, conversation } = req.body;
+    
+    const result = await askProjectAI(projectId, question, conversation);
+    res.json(result);
+  } catch (err) {
+    console.error("❌ Error asking project AI:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get project conversations (PUBLIC)
+app.get("/api/projects/:projectId/conversations", async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const conversations = await getProjectConversations(projectId);
+    res.json(conversations);
+  } catch (err) {
+    console.error("❌ Error fetching project conversations:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get project files (PUBLIC)
+app.get("/api/projects/:projectId/files", async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const files = await getProjectFiles(projectId);
+    res.json(files);
+  } catch (err) {
+    console.error("❌ Error fetching project files:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete project conversation (owner only)
+app.delete("/api/projects/:projectId/conversations/:conversationId", verifyToken, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const { projectId, conversationId } = req.params;
+    const result = await deleteProjectConversation(uid, projectId, conversationId);
+    res.json(result);
+  } catch (err) {
+    console.error("❌ Error deleting project conversation:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete project file (owner only)
+app.delete("/api/projects/:projectId/files/:fileId", verifyToken, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const { projectId, fileId } = req.params;
+    const result = await deleteProjectFile(uid, projectId, fileId);
+    res.json(result);
+  } catch (err) {
+    console.error("❌ Error deleting project file:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==============================================
+// OAUTH ROUTES
+// ==============================================
 
 // Replace with Firestore
 const pendingAuthsRef = db.collection("oauthPendingAuths");
@@ -1301,7 +1709,6 @@ app.get("/oauth/cleanup", async (req, res) => {
   await batch.commit();
   
   res.json({ deleted: oldDocs.size });
-
 });
 
 // ==============================================
