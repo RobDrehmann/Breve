@@ -8,7 +8,7 @@ import fs from "fs";
 import FormData from "form-data";
 
 // ✅ Token and base API
-const API_URL = "http://localhost:8080";
+const API_URL = "https://breve-hr2r.onrender.com";
 let AUTH_TOKEN;
 let CURRENT_USER = {};
 if (!AUTH_TOKEN) console.warn("⚠️ No AUTH_TOKEN provided; requests may be rejected.");
@@ -69,7 +69,7 @@ server.registerTool(
 
     app.listen(3333);
 
-    const loginUrl = "http://localhost:8080/oauth/start";
+    const loginUrl = `${API_URL}/oauth/start`;
     const message = `
 To sign in, open this link in your browser:
 ${loginUrl}
@@ -175,7 +175,7 @@ server.registerTool(
         }
   
         // Build request URL to your backend
-        const url = `http://localhost:8080/api/getprofile?uid=${encodeURIComponent(uid)}`;
+        const url = `${API_URL}/api/getprofile?uid=${encodeURIComponent(uid)}`;
        // console.log("➡️ Fetching:", url);
   
         const res = await fetch(url, {

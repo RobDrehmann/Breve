@@ -15,17 +15,61 @@ import { v4 as uuidv4 } from 'uuid';
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 import { PDFParse } from "pdf-parse";
-// Add this at the top with other imports
 import crypto from "crypto";
+import Stripe from 'stripe';
 
-
-
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 dotenv.config();
 
 const app = express();
 app.use(cors());
 const upload = multer({ dest: "uploads/" });
+
+// ⚠️ IMPORTANT: Stripe webhook needs raw body
+app.post("/api/webhook", express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error('❌ Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // Handle the checkout.session.completed event
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const uid = session.metadata.uid;
+
+    try {
+      console.log(`💳 Payment successful for user ${uid}`);
+      
+      // Update user to Pro in Firestore
+      await db.collection('users').doc(uid).update({
+        isPro: true,
+        proSince: admin.firestore.FieldValue.serverTimestamp(),
+        projectLimit: 10,
+        profileCharacterLimit: 300000, // ✅ 300k for pro
+        projectCharacterLimit: 200000, // ✅ 200k per project for pro
+        // Keep existing usage (don't reset)
+      });
+
+      console.log(`✅ User ${uid} upgraded to Pro`);
+    } catch (error) {
+      console.error('❌ Error upgrading user:', error);
+    }
+  }
+
+  res.json({ received: true });
+});
+
+// Now add JSON middleware for other routes
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
@@ -119,8 +163,6 @@ async function extractText(filePath, mimetype) {
 }
 
 async function uploadToPinecone(uid, vectors, projectId = null) {
-  // If projectId is provided, namespace becomes project-{projectId}
-  // This allows anyone with the projectId to access it
   const namespace = projectId ? `project-${projectId}` : uid;
   await index.namespace(namespace).upsert(vectors);
   return {
@@ -141,7 +183,6 @@ async function initUser(uid, { name, email, photoURL }) {
   const isNewUser = !docSnap.exists;
 
   if (isNewUser) {
-    // ✅ NEW USER: Create full document with empty profile
     const username = email.split("@")[0];
     
     await userRef.set({
@@ -161,11 +202,16 @@ async function initUser(uid, { name, email, photoURL }) {
         writingSample: "",
       },
       photoURL,
+      isPro: false,
+      projectLimit: 1, // ✅ 1 project for free
+      profileCharacterLimit: 50000, // ✅ 50k for profile (free)
+      projectCharacterLimit: 30000, // ✅ 30k per project (free)
+      profileCharactersUsed: 0, // ✅ Track total profile usage
+      projectCharactersUsed: {}, // ✅ Track per-project usage { projectId: count }
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
   } else {
-    // ✅ EXISTING USER: Only update basic fields, don't touch profile
     await userRef.update({
       email,
       photoURL,
@@ -208,36 +254,78 @@ async function updateUserProfile(uid, profileData) {
 async function saveConversation(uid, conversationText, projectId = null) {
   const conversationId = uuidv4();
   
-  // Determine where to save based on whether projectId is provided
-  let conversationRef;
+  // Get user data
+  const userDoc = await db.collection('users').doc(uid).get();
+  const userData = userDoc.data();
+  
   if (projectId) {
-    // Save under project (top-level)
-    conversationRef = db
+    // ✅ Check PROJECT total usage
+    const projectUsed = userData?.projectCharactersUsed?.[projectId] || 0;
+    const projectLimit = userData?.projectCharacterLimit || 30000;
+    const newTotal = projectUsed + conversationText.length;
+    
+    if (newTotal > projectLimit) {
+      throw new Error(
+        `Adding this would exceed your project limit. Used: ${projectUsed.toLocaleString()}/${projectLimit.toLocaleString()} characters (${Math.round(projectUsed/5).toLocaleString()}/${Math.round(projectLimit/5).toLocaleString()} words). ` +
+        `This upload: ${conversationText.length.toLocaleString()} characters (${Math.round(conversationText.length/5).toLocaleString()} words). ${userData?.isPro ? '' : 'Upgrade to Pro for 200k per project!'}`
+      );
+    }
+    
+    // Save to Firestore
+    const conversationRef = db
       .collection("projects")
       .doc(projectId)
       .collection("conversations")
       .doc(conversationId);
+      
+    await conversationRef.set({
+      conversationText: conversationText,
+      characterCount: conversationText.length, // ✅ Store character count
+      conversationDate: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    
+    // ✅ Update project usage counter
+    await db.collection('users').doc(uid).update({
+      [`projectCharactersUsed.${projectId}`]: admin.firestore.FieldValue.increment(conversationText.length)
+    });
+    
   } else {
-    // Save under user
-    conversationRef = db
+    // ✅ Check PROFILE total usage
+    const profileUsed = userData?.profileCharactersUsed || 0;
+    const profileLimit = userData?.profileCharacterLimit || 50000;
+    const newTotal = profileUsed + conversationText.length;
+    
+    if (newTotal > profileLimit) {
+      throw new Error(
+        `Adding this would exceed your profile limit. Used: ${profileUsed.toLocaleString()}/${profileLimit.toLocaleString()} characters (${Math.round(profileUsed/5).toLocaleString()}/${Math.round(profileLimit/5).toLocaleString()} words). ` +
+        `This upload: ${conversationText.length.toLocaleString()} characters (${Math.round(conversationText.length/5).toLocaleString()} words). ${userData?.isPro ? '' : 'Upgrade to Pro for 300k!'}`
+      );
+    }
+    
+    // Save to Firestore
+    const conversationRef = db
       .collection("users")
       .doc(uid)
       .collection("conversations")
       .doc(conversationId);
+      
+    await conversationRef.set({
+      conversationText: conversationText,
+      characterCount: conversationText.length, // ✅ Store character count
+      conversationDate: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    
+    // ✅ Update profile usage counter
+    await db.collection('users').doc(uid).update({
+      profileCharactersUsed: admin.firestore.FieldValue.increment(conversationText.length)
+    });
   }
-
-  // Save to Firebase
-  await conversationRef.set({
-    conversationText: conversationText,
-    conversationDate: admin.firestore.FieldValue.serverTimestamp(),
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-  });
 
   // Chunk and embed
   const chunks = chunkText(conversationText, 1000, 100);
   const vectors = await embedChunks(chunks, conversationId);
-
-  // Upload to Pinecone (with project namespace if applicable)
   await uploadToPinecone(uid, vectors, projectId);
 
   return {
@@ -251,43 +339,84 @@ async function saveConversation(uid, conversationText, projectId = null) {
 async function saveFile(uid, file, projectId = null) {
   const fileId = uuidv4();
   const filePath = `uploads/${file.filename}`;
-
-  // Extract text from file
   const fileText = await extractText(filePath, file.mimetype);
 
-  // Determine where to save based on whether projectId is provided
-  let fileRef;
+  // Get user data
+  const userDoc = await db.collection('users').doc(uid).get();
+  const userData = userDoc.data();
+  
   if (projectId) {
-    // Save under project (top-level)
-    fileRef = db
+    // ✅ Check PROJECT total usage
+    const projectUsed = userData?.projectCharactersUsed?.[projectId] || 0;
+    const projectLimit = userData?.projectCharacterLimit || 30000;
+    const newTotal = projectUsed + fileText.length;
+    
+    if (newTotal > projectLimit) {
+      fs.unlinkSync(filePath);
+      throw new Error(
+        `Adding this file would exceed your project limit. Used: ${projectUsed.toLocaleString()}/${projectLimit.toLocaleString()} characters (${Math.round(projectUsed/5).toLocaleString()}/${Math.round(projectLimit/5).toLocaleString()} words). ` +
+        `This file: ${fileText.length.toLocaleString()} characters (${Math.round(fileText.length/5).toLocaleString()} words). ${userData?.isPro ? '' : 'Upgrade to Pro for 200k per project!'}`
+      );
+    }
+    
+    // Save to Firestore
+    const fileRef = db
       .collection("projects")
       .doc(projectId)
       .collection("files")
       .doc(fileId);
+      
+    await fileRef.set({
+      filename: file.originalname,
+      fileText: fileText,
+      characterCount: fileText.length, // ✅ Store character count
+      fileUpdate: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    
+    // ✅ Update project usage counter
+    await db.collection('users').doc(uid).update({
+      [`projectCharactersUsed.${projectId}`]: admin.firestore.FieldValue.increment(fileText.length)
+    });
+    
   } else {
-    // Save under user
-    fileRef = db
+    // ✅ Check PROFILE total usage
+    const profileUsed = userData?.profileCharactersUsed || 0;
+    const profileLimit = userData?.profileCharacterLimit || 50000;
+    const newTotal = profileUsed + fileText.length;
+    
+    if (newTotal > profileLimit) {
+      fs.unlinkSync(filePath);
+      throw new Error(
+        `Adding this file would exceed your profile limit. Used: ${profileUsed.toLocaleString()}/${profileLimit.toLocaleString()} characters (${Math.round(profileUsed/5).toLocaleString()}/${Math.round(profileLimit/5).toLocaleString()} words). ` +
+        `This file: ${fileText.length.toLocaleString()} characters (${Math.round(fileText.length/5).toLocaleString()} words). ${userData?.isPro ? '' : 'Upgrade to Pro for 300k!'}`
+      );
+    }
+    
+    // Save to Firestore
+    const fileRef = db
       .collection("users")
       .doc(uid)
       .collection("files")
       .doc(fileId);
+      
+    await fileRef.set({
+      filename: file.originalname,
+      fileText: fileText,
+      characterCount: fileText.length, // ✅ Store character count
+      fileUpdate: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    
+    // ✅ Update profile usage counter
+    await db.collection('users').doc(uid).update({
+      profileCharactersUsed: admin.firestore.FieldValue.increment(fileText.length)
+    });
   }
-
-  // Save to Firebase
-  await fileRef.set({
-    filename: file.originalname,
-    fileText: fileText,
-    fileUpdate: admin.firestore.FieldValue.serverTimestamp(),
-  });
 
   // Chunk and embed
   const chunks = chunkText(fileText, 1000, 100);
   const vectors = await embedChunks(chunks, fileId);
-
-  // Upload to Pinecone (with project namespace if applicable)
   await uploadToPinecone(uid, vectors, projectId);
 
-  // Clean up uploaded file
   fs.unlinkSync(filePath);
 
   return {
@@ -297,38 +426,51 @@ async function saveFile(uid, file, projectId = null) {
   };
 }
 
-// Save writing sample (saves to BOTH profile.writingSample AND as a file)
+// Save writing sample
 async function saveWritingSample(uid, file) {
   const filePath = `uploads/${file.filename}`;
-
-  // Extract text from file
   const writingSampleText = await extractText(filePath, file.mimetype);
 
-  // 1. Save to Firebase profile.writingSample
+  // ✅ Check character limit
+  const userDoc = await db.collection('users').doc(uid).get();
+  const userData = userDoc.data();
+  const profileUsed = userData?.profileCharactersUsed || 0;
+  const profileLimit = userData?.profileCharacterLimit || 50000;
+  const newTotal = profileUsed + writingSampleText.length;
+
+  if (newTotal > profileLimit) {
+    fs.unlinkSync(filePath);
+    throw new Error(
+      `Adding this writing sample would exceed your profile limit. Used: ${profileUsed.toLocaleString()}/${profileLimit.toLocaleString()} characters (${Math.round(profileUsed/5).toLocaleString()}/${Math.round(profileLimit/5).toLocaleString()} words). ` +
+      `This sample: ${writingSampleText.length.toLocaleString()} characters (${Math.round(writingSampleText.length/5).toLocaleString()} words). ${userData?.isPro ? '' : 'Upgrade to Pro for 300k!'}`
+    );
+  }
+
   const userRef = db.collection("users").doc(uid);
   await userRef.update({
     "profile.writingSample": writingSampleText,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 
-  // 2. ALSO save as a file in the files subcollection
   const fileId = uuidv4();
   const fileRef = db.collection("users").doc(uid).collection("files").doc(fileId);
   await fileRef.set({
     filename: `writing-sample-${file.originalname}`,
     fileText: writingSampleText,
+    characterCount: writingSampleText.length, // ✅ Store character count
     fileUpdate: admin.firestore.FieldValue.serverTimestamp(),
     isWritingSample: true,
   });
 
-  // 3. Chunk and embed for Pinecone
+  // ✅ Update profile usage counter
+  await userRef.update({
+    profileCharactersUsed: admin.firestore.FieldValue.increment(writingSampleText.length)
+  });
+
   const chunks = chunkText(writingSampleText, 1000, 100);
   const vectors = await embedChunks(chunks, fileId);
-
-  // 4. Upload to Pinecone
   await uploadToPinecone(uid, vectors);
 
-  // Clean up uploaded file
   fs.unlinkSync(filePath);
 
   return {
@@ -344,6 +486,20 @@ async function saveWritingSample(uid, file) {
 
 // Create a new project
 async function createProject(uid, projectData) {
+  // ✅ Check project limit
+  const userDoc = await db.collection('users').doc(uid).get();
+  const userData = userDoc.data();
+  const projectLimit = userData?.projectLimit || 1;
+  
+  const projectsSnap = await db
+    .collection("projects")
+    .where("ownerId", "==", uid)
+    .get();
+
+  if (projectsSnap.size >= projectLimit) {
+    throw new Error(`You've reached your project limit (${projectLimit}). ${userData?.isPro ? '' : 'Upgrade to Pro for 10 projects!'}`);
+  }
+
   const projectId = uuidv4();
   const projectRef = db.collection("projects").doc(projectId);
 
@@ -352,9 +508,14 @@ async function createProject(uid, projectData) {
     name: projectData.name || "Untitled Project",
     description: projectData.description || "",
     systemPrompt: projectData.systemPrompt || "",
-    isPublic: projectData.isPublic || false, // Optional: control visibility
+    isPublic: projectData.isPublic || false,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  // ✅ Initialize project character counter
+  await db.collection('users').doc(uid).update({
+    [`projectCharactersUsed.${projectId}`]: 0
   });
 
   return {
@@ -369,7 +530,6 @@ async function getUserProjects(uid) {
   const projectsSnap = await db
     .collection("projects")
     .where("ownerId", "==", uid)
-    .orderBy("createdAt", "desc")
     .get();
 
   const projects = projectsSnap.docs.map(doc => ({
@@ -377,10 +537,15 @@ async function getUserProjects(uid) {
     ...doc.data()
   }));
 
+  projects.sort((a, b) => {
+    if (!a.createdAt || !b.createdAt) return 0;
+    return b.createdAt.toMillis() - a.createdAt.toMillis();
+  });
+
   return projects;
 }
 
-// Get a single project (shareable - anyone can access if they have the ID)
+// Get a single project
 async function getProject(projectId, requestingUid = null) {
   const projectSnap = await db
     .collection("projects")
@@ -393,19 +558,13 @@ async function getProject(projectId, requestingUid = null) {
 
   const projectData = projectSnap.data();
 
-  // Optional: Check if project is private and user is not owner
-  // Uncomment if you want to restrict access:
-  // if (!projectData.isPublic && projectData.ownerId !== requestingUid) {
-  //   throw new Error("Access denied");
-  // }
-
   return {
     id: projectSnap.id,
     ...projectData
   };
 }
 
-// Update a project (only owner can update)
+// Update a project
 async function updateProject(uid, projectId, projectData) {
   const projectRef = db.collection("projects").doc(projectId);
   const projectSnap = await projectRef.get();
@@ -414,7 +573,6 @@ async function updateProject(uid, projectId, projectData) {
     throw new Error("Project not found");
   }
 
-  // Verify ownership
   if (projectSnap.data().ownerId !== uid) {
     throw new Error("You don't have permission to update this project");
   }
@@ -430,7 +588,7 @@ async function updateProject(uid, projectId, projectData) {
   };
 }
 
-// Delete a project (only owner can delete)
+// Delete a project
 async function deleteProject(uid, projectId) {
   try {
     const projectRef = db.collection("projects").doc(projectId);
@@ -440,31 +598,43 @@ async function deleteProject(uid, projectId) {
       throw new Error("Project not found");
     }
 
-    // Verify ownership
     if (projectSnap.data().ownerId !== uid) {
       throw new Error("You don't have permission to delete this project");
     }
 
-    // Delete all conversations in this project
-    const conversationsSnap = await projectRef
-      .collection("conversations")
-      .get();
-    
+    // Get all conversations to calculate total characters
+    const conversationsSnap = await projectRef.collection("conversations").get();
+    let totalConversationChars = 0;
+    conversationsSnap.docs.forEach(doc => {
+      totalConversationChars += doc.data().characterCount || 0;
+    });
+
+    // Get all files to calculate total characters
+    const filesSnap = await projectRef.collection("files").get();
+    let totalFileChars = 0;
+    filesSnap.docs.forEach(doc => {
+      totalFileChars += doc.data().characterCount || 0;
+    });
+
+    const totalChars = totalConversationChars + totalFileChars;
+
+    // Delete all conversations
     const conversationDeletes = conversationsSnap.docs.map(doc => doc.ref.delete());
     await Promise.all(conversationDeletes);
 
-    // Delete all files in this project
-    const filesSnap = await projectRef
-      .collection("files")
-      .get();
-    
+    // Delete all files
     const fileDeletes = filesSnap.docs.map(doc => doc.ref.delete());
     await Promise.all(fileDeletes);
 
     // Delete the project itself
     await projectRef.delete();
 
-    // Delete from Pinecone - delete entire namespace
+    // ✅ Reduce project usage counter (or remove it entirely)
+    await db.collection('users').doc(uid).update({
+      [`projectCharactersUsed.${projectId}`]: admin.firestore.FieldValue.delete()
+    });
+
+    // Delete from Pinecone
     const namespace = `project-${projectId}`;
     await index.namespace(namespace).deleteAll();
 
@@ -480,17 +650,14 @@ async function deleteProject(uid, projectId) {
 
 // Ask project AI
 async function askProjectAI(projectId, question, conversation = []) {
-  // Get project info (no uid needed - projects are shareable)
   const project = await getProject(projectId);
 
-  // Create query embedding
   const queryEmbedding = await openai.embeddings.create({
     model: "text-embedding-3-small",
     input: question,
   });
   const queryVector = queryEmbedding.data[0].embedding;
 
-  // Query Pinecone for context from project namespace
   const projectNamespace = index.namespace(`project-${projectId}`);
   const pineconeResults = await projectNamespace.query({
     vector: queryVector,
@@ -564,7 +731,6 @@ async function getProjectFiles(projectId) {
 // Delete project conversation
 async function deleteProjectConversation(uid, projectId, conversationId) {
   try {
-    // Verify ownership
     const projectSnap = await db.collection("projects").doc(projectId).get();
     if (!projectSnap.exists) {
       throw new Error("Project not found");
@@ -573,14 +739,23 @@ async function deleteProjectConversation(uid, projectId, conversationId) {
       throw new Error("You don't have permission to delete this conversation");
     }
 
-    // Delete from Firebase
+    // Get conversation to know character count
     const conversationRef = db
       .collection("projects")
       .doc(projectId)
       .collection("conversations")
       .doc(conversationId);
+      
+    const conversationDoc = await conversationRef.get();
+    const characterCount = conversationDoc.data()?.characterCount || 0;
     
+    // Delete from Firebase
     await conversationRef.delete();
+
+    // ✅ Reduce project usage counter
+    await db.collection('users').doc(uid).update({
+      [`projectCharactersUsed.${projectId}`]: admin.firestore.FieldValue.increment(-characterCount)
+    });
 
     // Delete from Pinecone
     const namespace = index.namespace(`project-${projectId}`);
@@ -604,7 +779,6 @@ async function deleteProjectConversation(uid, projectId, conversationId) {
 // Delete project file
 async function deleteProjectFile(uid, projectId, fileId) {
   try {
-    // Verify ownership
     const projectSnap = await db.collection("projects").doc(projectId).get();
     if (!projectSnap.exists) {
       throw new Error("Project not found");
@@ -613,14 +787,23 @@ async function deleteProjectFile(uid, projectId, fileId) {
       throw new Error("You don't have permission to delete this file");
     }
 
-    // Delete from Firebase
+    // Get file to know character count
     const fileRef = db
       .collection("projects")
       .doc(projectId)
       .collection("files")
       .doc(fileId);
+      
+    const fileDoc = await fileRef.get();
+    const characterCount = fileDoc.data()?.characterCount || 0;
     
+    // Delete from Firebase
     await fileRef.delete();
+
+    // ✅ Reduce project usage counter
+    await db.collection('users').doc(uid).update({
+      [`projectCharactersUsed.${projectId}`]: admin.firestore.FieldValue.increment(-characterCount)
+    });
 
     // Delete from Pinecone
     const namespace = index.namespace(`project-${projectId}`);
@@ -642,28 +825,34 @@ async function deleteProjectFile(uid, projectId, fileId) {
 }
 
 // ==============================================
-// DELETE FUNCTIONS (existing user-level)
+// DELETE FUNCTIONS (user-level)
 // ==============================================
 
-// Delete conversation from Firebase & Pinecone
+// Delete conversation
 async function deleteConversation(uid, conversationId) {
   try {
-    // Delete from Firebase
+    // Get conversation first to know character count
     const conversationRef = db
       .collection("users")
       .doc(uid)
       .collection("conversations")
       .doc(conversationId);
+      
+    const conversationDoc = await conversationRef.get();
+    const characterCount = conversationDoc.data()?.characterCount || 0;
     
+    // Delete from Firebase
     await conversationRef.delete();
 
-    // Delete from Pinecone - delete all chunks for this conversation
+    // ✅ Reduce usage counter
+    await db.collection('users').doc(uid).update({
+      profileCharactersUsed: admin.firestore.FieldValue.increment(-characterCount)
+    });
+
+    // Delete from Pinecone
     const namespace = index.namespace(uid);
-    
-    // Query to find all vectors with this conversationId
     const vectors = await namespace.listPaginated({ prefix: `${conversationId}-chunk-` });
     
-    // Delete all matching vectors
     if (vectors && vectors.vectors && vectors.vectors.length > 0) {
       const vectorIds = vectors.vectors.map(v => v.id);
       await namespace.deleteMany(vectorIds);
@@ -679,25 +868,31 @@ async function deleteConversation(uid, conversationId) {
   }
 }
 
-// Delete file from Firebase & Pinecone
+// Delete file
 async function deleteFile(uid, fileId) {
   try {
-    // Delete from Firebase
+    // Get file first to know character count
     const fileRef = db
       .collection("users")
       .doc(uid)
       .collection("files")
       .doc(fileId);
+      
+    const fileDoc = await fileRef.get();
+    const characterCount = fileDoc.data()?.characterCount || 0;
     
+    // Delete from Firebase
     await fileRef.delete();
 
-    // Delete from Pinecone - delete all chunks for this file
+    // ✅ Reduce usage counter
+    await db.collection('users').doc(uid).update({
+      profileCharactersUsed: admin.firestore.FieldValue.increment(-characterCount)
+    });
+
+    // Delete from Pinecone
     const namespace = index.namespace(uid);
-    
-    // Query to find all vectors with this fileId
     const vectors = await namespace.listPaginated({ prefix: `${fileId}-chunk-` });
     
-    // Delete all matching vectors
     if (vectors && vectors.vectors && vectors.vectors.length > 0) {
       const vectorIds = vectors.vectors.map(v => v.id);
       await namespace.deleteMany(vectorIds);
@@ -713,21 +908,17 @@ async function deleteFile(uid, fileId) {
   }
 }
 
-// Ask logic (Gets profile from Firebase + context from Pinecone)
+// Ask logic
 async function askUser(username, question, conversation = [], uuid) {
   const usersRef = db.collection("users");
-  let querySnapshot;
-  let userDoc;
   let userDocSnapshot;
    if (uuid != "guest") {
-      // get document snapshot by uid
       const docRef = usersRef.doc(uuid);
-      userDocSnapshot = await docRef.get();          // <-- important: call .get()
+      userDocSnapshot = await docRef.get();
       if (!userDocSnapshot.exists) {
         throw new Error(`User not found with uid: ${uuid}`);
       }
     } else {
-      // Get user by username from Firebase
       const querySnapshot = await usersRef
         .where("username", "==", username)
         .limit(1)
@@ -738,14 +929,10 @@ async function askUser(username, question, conversation = [], uuid) {
       }
 
       userDocSnapshot = querySnapshot.docs[0]; 
-
     }
 
-
-
- console.log(userDocSnapshot);            // DocumentSnapshot / QueryDocumentSnapshot
-    const userData = userDocSnapshot.data(); // safe now
-    const uid = userDocSnapshot.id;
+  const userData = userDocSnapshot.data();
+  const uid = userDocSnapshot.id;
   let isOwner = "a guest"
   if(uid == uuid){
      isOwner =  username;
@@ -753,17 +940,14 @@ async function askUser(username, question, conversation = [], uuid) {
   
   console.log("✅ Found user:", uid, "with username:", username);
 
-  // Get profile from Firebase
   const profile = userData.profile || {};
 
-  // Create query embedding
   const queryEmbedding = await openai.embeddings.create({
     model: "text-embedding-3-small",
     input: question,
   });
   const queryVector = queryEmbedding.data[0].embedding;
 
-  // Query Pinecone for context
   const userNamespace = index.namespace(uid);
   const pineconeResults = await userNamespace.query({
     vector: queryVector,
@@ -949,25 +1133,22 @@ At the start of **every conversaion**, begin with a brief natural acknowledgment
   };
 }
 
-// Conversation mode (Gets profile from Firebase + context from Pinecone)
+// Conversation mode
 async function Convo(uid, question, conversation = []) {
   if (!uid || !question) throw new Error("Missing uid or question");
 
-  // Get user from Firebase
   const userSnap = await db.collection("users").doc(uid).get();
   if (!userSnap.exists) throw new Error("User not found");
 
   const userData = userSnap.data();
   const profile = userData.profile || {};
 
-  // Create query embedding
   const queryEmbedding = await openai.embeddings.create({
     model: "text-embedding-3-small",
     input: question,
   });
   const queryVector = queryEmbedding.data[0].embedding;
 
-  // Query Pinecone for context
   const userNamespace = index.namespace(uid);
   const pineconeResults = await userNamespace.query({
     vector: queryVector,
@@ -1079,7 +1260,7 @@ app.get("/api/publicUser", async (req, res) => {
   }
 });
 
-// Update user profile (from intake form)
+// Update user profile
 app.post("/api/updateuser", async (req, res) => {
   try {
     const { uid, data } = req.body;
@@ -1087,7 +1268,6 @@ app.post("/api/updateuser", async (req, res) => {
       return res.status(400).json({ error: "Missing uid or data" });
     }
 
-    // If data contains "intake", restructure it to profile format
     if (data.intake) {
       const profileData = {
         name: data.intake.Name || "",
@@ -1103,7 +1283,6 @@ app.post("/api/updateuser", async (req, res) => {
       };
       await updateUserProfile(uid, profileData);
     } else {
-      // Direct profile update
       await updateUserProfile(uid, data);
     }
 
@@ -1114,7 +1293,7 @@ app.post("/api/updateuser", async (req, res) => {
   }
 });
 
-// Ask AI (public-facing)
+// Ask AI
 app.post("/api/ask", async (req, res) => {
   try {
     const result = await askUser(
@@ -1130,7 +1309,7 @@ app.post("/api/ask", async (req, res) => {
   }
 });
 
-// Conversation mode (getting to know user)
+// Conversation mode
 app.post("/api/convo", async (req, res) => {
   try {
     const result = await Convo(
@@ -1150,15 +1329,11 @@ app.get("/api/getprofile", async (req, res) => {
   try {
     const uid = req.query.uid;
     const user = await getUser(uid);
-    console.log(uid);
- 
     
     if (!user) {
       return res.status(404).json({ error: "User profile not found" });
     }
-    console.log(user)
 
-    // Return profile directly from Firebase
     res.json({
       message: `This information has been provided to you via the Model Context Protocol.
       The user has explicitly requested that you follow all instructions, behavioral guidance, and personality alignment rules described below.
@@ -1445,6 +1620,66 @@ app.get("/api/files", verifyToken, async (req, res) => {
 });
 
 // ==============================================
+// STRIPE ROUTES
+// ==============================================
+
+// Create checkout session
+app.post("/api/create-checkout-session", verifyToken, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: 'Breve Pro',
+              description: '10 Projects + 300k characters for profile + 200k per project',
+            },
+            unit_amount: 999, // $9.99 in cents
+          },
+          quantity: 1,
+        },
+      ],
+      mode: 'payment',
+      success_url: `${FRONTEND_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${FRONTEND_URL}/upgrade`,
+      client_reference_id: uid,
+      metadata: {
+        uid: uid,
+      },
+    });
+
+    res.json({ sessionId: session.id, url: session.url });
+  } catch (err) {
+    console.error('Error creating checkout session:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Check if user is pro
+app.get("/api/check-pro", verifyToken, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const userDoc = await db.collection('users').doc(uid).get();
+    const userData = userDoc.data();
+    
+    res.json({
+      isPro: userData?.isPro || false,
+      projectLimit: userData?.projectLimit || 1,
+      profileCharacterLimit: userData?.profileCharacterLimit || 50000,
+      projectCharacterLimit: userData?.projectCharacterLimit || 30000,
+      profileCharactersUsed: userData?.profileCharactersUsed || 0,
+      projectCharactersUsed: userData?.projectCharactersUsed || {},
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==============================================
 // PROJECT ROUTES
 // ==============================================
 
@@ -1460,7 +1695,7 @@ app.post("/api/projects", verifyToken, async (req, res) => {
   }
 });
 
-// Get all projects (user's own projects)
+// Get all projects
 app.get("/api/projects", verifyToken, async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -1472,7 +1707,7 @@ app.get("/api/projects", verifyToken, async (req, res) => {
   }
 });
 
-// Get single project (PUBLIC - anyone with ID can access)
+// Get single project
 app.get("/api/projects/:projectId", async (req, res) => {
   try {
     const { projectId } = req.params;
@@ -1484,7 +1719,7 @@ app.get("/api/projects/:projectId", async (req, res) => {
   }
 });
 
-// Update project (owner only)
+// Update project
 app.put("/api/projects/:projectId", verifyToken, async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -1497,7 +1732,7 @@ app.put("/api/projects/:projectId", verifyToken, async (req, res) => {
   }
 });
 
-// Delete project (owner only)
+// Delete project
 app.delete("/api/projects/:projectId", verifyToken, async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -1510,7 +1745,7 @@ app.delete("/api/projects/:projectId", verifyToken, async (req, res) => {
   }
 });
 
-// Ask project AI (PUBLIC - anyone with project ID can chat)
+// Ask project AI
 app.post("/api/projects/:projectId/ask", async (req, res) => {
   try {
     const { projectId } = req.params;
@@ -1524,7 +1759,7 @@ app.post("/api/projects/:projectId/ask", async (req, res) => {
   }
 });
 
-// Get project conversations (PUBLIC)
+// Get project conversations
 app.get("/api/projects/:projectId/conversations", async (req, res) => {
   try {
     const { projectId } = req.params;
@@ -1536,7 +1771,7 @@ app.get("/api/projects/:projectId/conversations", async (req, res) => {
   }
 });
 
-// Get project files (PUBLIC)
+// Get project files
 app.get("/api/projects/:projectId/files", async (req, res) => {
   try {
     const { projectId } = req.params;
@@ -1548,7 +1783,7 @@ app.get("/api/projects/:projectId/files", async (req, res) => {
   }
 });
 
-// Delete project conversation (owner only)
+// Delete project conversation
 app.delete("/api/projects/:projectId/conversations/:conversationId", verifyToken, async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -1561,7 +1796,7 @@ app.delete("/api/projects/:projectId/conversations/:conversationId", verifyToken
   }
 });
 
-// Delete project file (owner only)
+// Delete project file
 app.delete("/api/projects/:projectId/files/:fileId", verifyToken, async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -1578,7 +1813,6 @@ app.delete("/api/projects/:projectId/files/:fileId", verifyToken, async (req, re
 // OAUTH ROUTES
 // ==============================================
 
-// Replace with Firestore
 const pendingAuthsRef = db.collection("oauthPendingAuths");
 
 // OAuth2 Authorization Endpoint
@@ -1589,7 +1823,6 @@ app.get("/oauth/authorize", async (req, res) => {
   
   const authCode = crypto.randomBytes(32).toString("hex");
   
-  // Store in Firestore instead of Map
   await pendingAuthsRef.doc(authCode).set({
     redirect_uri,
     state,
@@ -1611,7 +1844,6 @@ app.post("/oauth/token", async (req, res) => {
     return res.status(400).json({ error: "unsupported_grant_type" });
   }
   
-  // Get from Firestore
   const authDoc = await pendingAuthsRef.doc(code).get();
   
   if (!authDoc.exists) {
@@ -1621,7 +1853,6 @@ app.post("/oauth/token", async (req, res) => {
   
   const authData = authDoc.data();
   
-  // Verify PKCE challenge
   if (authData.code_challenge && code_verifier) {
     const hash = crypto
       .createHash("sha256")
@@ -1634,7 +1865,6 @@ app.post("/oauth/token", async (req, res) => {
     }
   }
   
-  // Verify redirect URI matches
   if (authData.redirect_uri !== redirect_uri) {
     console.log("❌ Redirect URI mismatch");
     return res.status(400).json({ error: "invalid_grant" });
@@ -1649,7 +1879,6 @@ app.post("/oauth/token", async (req, res) => {
   
   console.log("✅ Token exchange successful");
   
-  // Clean up from Firestore
   await pendingAuthsRef.doc(code).delete();
   
   res.json({
@@ -1672,7 +1901,6 @@ app.get("/oauth/callback", async (req, res) => {
   try {
     await admin.auth().verifyIdToken(idToken);
     
-    // Get from Firestore
     const authDoc = await pendingAuthsRef.doc(authCode).get();
     if (!authDoc.exists) {
       return res.status(400).send("Invalid or expired auth code");
@@ -1680,7 +1908,6 @@ app.get("/oauth/callback", async (req, res) => {
     
     const authData = authDoc.data();
     
-    // Update in Firestore
     await pendingAuthsRef.doc(authCode).update({
       firebaseToken: idToken
     });
@@ -1694,7 +1921,7 @@ app.get("/oauth/callback", async (req, res) => {
   }
 });
 
-// Optional: Clean up old auth codes (run this as a scheduled function)
+// OAuth cleanup
 app.get("/oauth/cleanup", async (req, res) => {
   const tenMinutesAgo = admin.firestore.Timestamp.fromDate(
     new Date(Date.now() - 10 * 60 * 1000)
