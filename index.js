@@ -92,13 +92,22 @@ const bucket = admin.storage().bucket();
 // HELPERS
 // ==============================================
 async function verifyToken(req, res, next) {
+  console.log("Authorization header:", req.headers.authorization);
+
   const token = req.headers.authorization?.split("Bearer ")[1];
-  if (!token) return res.status(401).json({ error: "Missing token" });
+
+  if (!token) {
+    console.log("No token received");
+    return res.status(401).json({ error: "Missing token" });
+  }
+
   try {
     const decoded = await admin.auth().verifyIdToken(token);
+    console.log("Token verified for uid:", decoded.uid);
     req.user = decoded;
     next();
-  } catch {
+  } catch (err) {
+    console.error("verifyIdToken failed:", err);
     res.status(401).json({ error: "Invalid token" });
   }
 }
